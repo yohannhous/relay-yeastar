@@ -30,6 +30,7 @@ SIP_USER      = os.environ.get("SIP_USER", "")
 SIP_PASS      = os.environ.get("SIP_PASS", "")
 SIP_EXTENSION = os.environ.get("SIP_EXTENSION", "900")
 SIP_PORT      = int(os.environ.get("SIP_PORT", "5060"))
+SIP_PROXY     = os.environ.get("SIP_PROXY", "")   # ex: autorack.proxy.rlwy.net:36296
 RTP_PORT_BASE = int(os.environ.get("RTP_PORT_BASE", "20000"))
 
 OPENAI_WS_URL = (
@@ -37,9 +38,19 @@ OPENAI_WS_URL = (
     "?model=gpt-4o-realtime-preview-2024-12-17"
 )
 
-# ── Utilitaires SIP ──────────────────────────────────────────────────────────
+# ── Utilitaires ──────────────────────────────────────────────────────────────
 def md5h(s):
     return hashlib.md5(s.encode()).hexdigest()
+
+def get_local_ip():
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect((SIP_SERVER, SIP_PORT))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except Exception:
+        return "0.0.0.0"
 
 def parse_header(msg, header):
     m = re.search(rf'^{header}\s*:\s*(.+)$', msg, re.MULTILINE | re.IGNORECASE)
@@ -51,7 +62,7 @@ def build_response(request, code, reason, extra_headers="", body=""):
     to_h    = parse_header(request, "To")
     call_id = parse_header(request, "Call-ID")
     cseq    = parse_header(request, "CSeq")
-    content_type = f"Content-Type: application/sdp\r\n" if body else ""
+    content_type = "Content-Type: application/sdp\r\n" if body else ""
     return (
         f"SIP/2.0 {code} {reason}\r\n"
         f"Via: {via}\r\n"
@@ -59,7 +70,7 @@ def build_response(request, code, reason, extra_headers="", body=""):
         f"To: {to_h}\r\n"
         f"Call-ID: {call_id}\r\n"
         f"CSeq: {cseq}\r\n"
-        f"Contact: <sip:{SIP_EXTENSION}@{SIP_SERVER}:{SIP_PORT}>\r\n"
+        f"Contact: <sip:{SIP_EXTENSION}@{SIP_SERVER};transport=tcp>\r\n"
         f"{extra_headers}"
         f"{content_type}"
         f"Content-Length: {len(body)}\r\n"
@@ -87,16 +98,6 @@ def parse_sdp_ip(sdp, fallback):
     m = re.search(r'c=IN IP4 ([\d.]+)', sdp)
     return m.group(1) if m else fallback
 
-def get_local_ip():
-    try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.connect((SIP_SERVER, SIP_PORT))
-        ip = s.getsockname()[0]
-        s.close()
-        return ip
-    except Exception:
-        return "0.0.0.0"
-
 def build_rtp_packet(seq, ts, ssrc, payload):
     header = struct.pack('!BBHII', 0x80, 0x00, seq, ts, ssrc)
     return header + payload
@@ -106,9 +107,8 @@ def parse_rtp_payload(data):
         return b""
     return data[12:]
 
-# ── Pont OpenAI Realtime ────────────────────────────────────────────────────
+# ── Pont OpenAI Realtime ─────────────────────────────────────────────────────
 async def openai_bridge(rtp_sock, remote_ip, remote_port):
-    """Pont bidirectionnel RTP ↔ OpenAI Realtime"""
     print(f"🤖 Connexion OpenAI Realtime...")
     ssrc = random.randint(0, 0xFFFFFFFF)
     seq  = 0
@@ -147,7 +147,6 @@ async def openai_bridge(rtp_sock, remote_ip, remote_port):
             loop = asyncio.get_event_loop()
 
             async def rtp_to_openai():
-                """RTP entrant (G.711 µ-law) → OpenAI PCM16"""
                 while True:
                     try:
                         data = await loop.run_in_executor(None, lambda: rtp_sock.recv(4096))
@@ -165,33 +164,26 @@ async def openai_bridge(rtp_sock, remote_ip, remote_port):
                         break
 
             async def openai_to_rtp():
-                """OpenAI PCM16 → RTP sortant (G.711 µ-law)"""
                 nonlocal seq, ts
                 try:
                     async for raw in openai_ws:
                         event = json.loads(raw)
-
                         if event.get("type") == "response.audio.delta":
-                            pcm24   = base64.b64decode(event["delta"])
-                            pcm8    = audioop.ratecv(pcm24, 2, 1, 24000, 8000, None)[0]
-                            ulaw    = audioop.lin2ulaw(pcm8, 2)
-                            # Envoie en paquets RTP de 160 bytes (20ms à 8kHz)
+                            pcm24 = base64.b64decode(event["delta"])
+                            pcm8  = audioop.ratecv(pcm24, 2, 1, 24000, 8000, None)[0]
+                            ulaw  = audioop.lin2ulaw(pcm8, 2)
                             for i in range(0, len(ulaw), 160):
-                                chunk  = ulaw[i:i+160]
-                                pkt    = build_rtp_packet(seq & 0xFFFF, ts & 0xFFFFFFFF, ssrc, chunk)
+                                chunk = ulaw[i:i+160]
+                                pkt   = build_rtp_packet(seq & 0xFFFF, ts & 0xFFFFFFFF, ssrc, chunk)
                                 rtp_sock.sendto(pkt, (remote_ip, remote_port))
                                 seq += 1
                                 ts  += 160
-
                         elif event.get("type") == "response.audio_transcript.delta":
                             print(f"🤖 {event.get('delta', '')}", end="", flush=True)
-
                         elif event.get("type") == "conversation.item.input_audio_transcription.completed":
                             print(f"\n👤 Client : {event.get('transcript', '')}")
-
                         elif event.get("type") == "error":
                             print(f"\n❌ OpenAI erreur : {event}")
-
                 except Exception as e:
                     print(f"OpenAI WS erreur : {e}")
 
@@ -200,103 +192,121 @@ async def openai_bridge(rtp_sock, remote_ip, remote_port):
     except Exception as e:
         print(f"❌ Connexion OpenAI échouée : {e}")
 
-# ── Serveur SIP UDP ──────────────────────────────────────────────────────────
-def sip_server_thread():
-    """Écoute les messages SIP entrants et répond aux INVITE"""
-    sip_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sip_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    sip_sock.bind(("0.0.0.0", SIP_PORT))
-    print(f"📡 Serveur SIP en écoute sur le port {SIP_PORT}")
-
+# ── Gestion d'une connexion SIP TCP ─────────────────────────────────────────
+def handle_sip_client(conn, addr):
     local_ip  = get_local_ip()
-    rtp_port  = RTP_PORT_BASE
-    call_loop = asyncio.new_event_loop()
+    rtp_port  = RTP_PORT_BASE + random.randint(0, 1000) * 2
+    buffer    = ""
+
+    print(f"📡 Connexion SIP TCP de {addr[0]}:{addr[1]}")
+
+    try:
+        conn.settimeout(300)
+        while True:
+            data = conn.recv(4096)
+            if not data:
+                break
+            buffer += data.decode(errors="ignore")
+
+            while "\r\n\r\n" in buffer:
+                header_part, rest = buffer.split("\r\n\r\n", 1)
+                cl_match = re.search(r'Content-Length:\s*(\d+)', header_part, re.IGNORECASE)
+                cl = int(cl_match.group(1)) if cl_match else 0
+
+                if len(rest) < cl:
+                    break  # attendre plus de données
+
+                msg    = header_part + "\r\n\r\n" + rest[:cl]
+                buffer = rest[cl:]
+
+                first_line = msg.split("\r\n")[0]
+                print(f"📨 SIP reçu : {first_line}")
+
+                if msg.startswith("REGISTER"):
+                    resp = build_response(msg, 200, "OK",
+                        extra_headers=f"Expires: 300\r\n")
+                    conn.sendall(resp.encode())
+
+                elif msg.startswith("INVITE"):
+                    print(f"📞 INVITE reçu de {addr[0]}")
+
+                    trying = build_response(msg, 100, "Trying")
+                    conn.sendall(trying.encode())
+
+                    sdp_body        = msg.split("\r\n\r\n", 1)[-1]
+                    remote_rtp_port = parse_sdp_port(sdp_body)
+                    remote_rtp_ip   = parse_sdp_ip(sdp_body, addr[0])
+
+                    ringing = build_response(msg, 180, "Ringing")
+                    conn.sendall(ringing.encode())
+                    time.sleep(0.3)
+
+                    # Ouvre socket RTP UDP
+                    rtp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                    rtp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                    rtp_sock.bind(("0.0.0.0", rtp_port))
+                    rtp_sock.settimeout(30)
+
+                    sdp  = build_sdp(rtp_port, local_ip)
+                    ok   = build_response(msg, 200, "OK", body=sdp)
+                    conn.sendall(ok.encode())
+                    print(f"✅ Appel accepté — RTP {local_ip}:{rtp_port} ↔ {remote_rtp_ip}:{remote_rtp_port}")
+
+                    def run_bridge():
+                        asyncio.run(openai_bridge(rtp_sock, remote_rtp_ip, remote_rtp_port))
+                        rtp_sock.close()
+                        print("📞 Appel terminé")
+
+                    t = threading.Thread(target=run_bridge, daemon=True)
+                    t.start()
+
+                elif msg.startswith("ACK"):
+                    pass
+
+                elif msg.startswith("BYE"):
+                    print("📵 BYE — appel raccroché")
+                    resp = build_response(msg, 200, "OK")
+                    conn.sendall(resp.encode())
+
+                elif msg.startswith("OPTIONS"):
+                    resp = build_response(msg, 200, "OK")
+                    conn.sendall(resp.encode())
+
+    except Exception as e:
+        print(f"⚠️ Connexion SIP erreur : {e}")
+    finally:
+        conn.close()
+        print(f"🔌 Connexion SIP fermée : {addr[0]}")
+
+# ── Serveur SIP TCP ──────────────────────────────────────────────────────────
+def sip_tcp_server():
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind(("0.0.0.0", SIP_PORT))
+    srv.listen(10)
+    print(f"📡 Serveur SIP TCP en écoute sur le port {SIP_PORT}")
 
     while True:
         try:
-            data, addr = sip_sock.recvfrom(65535)
-            msg = data.decode(errors="ignore")
-            first_line = msg.split("\r\n")[0]
-
-            # ── REGISTER ──
-            if msg.startswith("REGISTER"):
-                resp = build_response(msg, 200, "OK",
-                    extra_headers=f"Expires: 300\r\nDate: {time.strftime('%a, %d %b %Y %H:%M:%S GMT', time.gmtime())}\r\n")
-                sip_sock.sendto(resp.encode(), addr)
-
-            # ── INVITE ──
-            elif msg.startswith("INVITE"):
-                print(f"📞 INVITE reçu de {addr[0]}:{addr[1]}")
-
-                # 100 Trying
-                trying = build_response(msg, 100, "Trying")
-                sip_sock.sendto(trying.encode(), addr)
-
-                # Analyse SDP de l'appelant
-                sdp_part    = msg.split("\r\n\r\n", 1)[-1]
-                remote_rtp_port = parse_sdp_port(sdp_part)
-                remote_rtp_ip   = parse_sdp_ip(sdp_part, addr[0])
-
-                # 180 Ringing
-                ringing = build_response(msg, 180, "Ringing")
-                sip_sock.sendto(ringing.encode(), addr)
-                time.sleep(0.5)
-
-                # Ouvre socket RTP local
-                rtp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-                rtp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                rtp_sock.bind(("0.0.0.0", rtp_port))
-                rtp_sock.settimeout(30)
-
-                # 200 OK avec SDP
-                sdp  = build_sdp(rtp_port, local_ip)
-                ok   = build_response(msg, 200, "OK", body=sdp)
-                sip_sock.sendto(ok.encode(), addr)
-                print(f"✅ Appel accepté — RTP local:{rtp_port} → distant:{remote_rtp_ip}:{remote_rtp_port}")
-
-                # Lance le pont OpenAI dans un thread asyncio séparé
-                def run_bridge():
-                    asyncio.run(openai_bridge(rtp_sock, remote_rtp_ip, remote_rtp_port))
-                    rtp_sock.close()
-                    print("📞 Appel terminé — RTP fermé")
-
-                t = threading.Thread(target=run_bridge, daemon=True)
-                t.start()
-
-                rtp_port += 2  # prochain appel sur le port suivant
-
-            # ── ACK ──
-            elif msg.startswith("ACK"):
-                pass  # rien à faire
-
-            # ── BYE ──
-            elif msg.startswith("BYE"):
-                print("📵 BYE reçu — appel raccroché")
-                resp = build_response(msg, 200, "OK")
-                sip_sock.sendto(resp.encode(), addr)
-
-            # ── OPTIONS (keepalive) ──
-            elif msg.startswith("OPTIONS"):
-                resp = build_response(msg, 200, "OK")
-                sip_sock.sendto(resp.encode(), addr)
-
+            conn, addr = srv.accept()
+            t = threading.Thread(target=handle_sip_client, args=(conn, addr), daemon=True)
+            t.start()
         except Exception as e:
-            print(f"⚠️ SIP erreur : {e}")
+            print(f"⚠️ Serveur SIP erreur : {e}")
 
-# ── Enregistrement SIP vers Yeastar ─────────────────────────────────────────
+# ── Enregistrement SIP TCP vers Yeastar ─────────────────────────────────────
 def sip_registration_loop():
     if not (SIP_SERVER and SIP_USER and SIP_PASS):
         print("⚠️ Variables SIP manquantes")
         return
 
-    port    = SIP_PORT
     call_id = f"{os.urandom(8).hex()}@{SIP_SERVER}"
 
     while True:
         try:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            sock.settimeout(5)
-            addr = (SIP_SERVER, port)
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(10)
+            sock.connect((SIP_SERVER, SIP_PORT))
 
             via_branch = f"z9hG4bK{os.urandom(4).hex()}"
             tag        = os.urandom(4).hex()
@@ -304,12 +314,12 @@ def sip_registration_loop():
             def make_register(cseq, auth_header=""):
                 msg = (
                     f"REGISTER sip:{SIP_SERVER} SIP/2.0\r\n"
-                    f"Via: SIP/2.0/UDP {SIP_SERVER}:{port};branch={via_branch}\r\n"
+                    f"Via: SIP/2.0/TCP {SIP_SERVER}:{SIP_PORT};branch={via_branch}\r\n"
                     f"From: <sip:{SIP_EXTENSION}@{SIP_SERVER}>;tag={tag}\r\n"
                     f"To: <sip:{SIP_EXTENSION}@{SIP_SERVER}>\r\n"
                     f"Call-ID: {call_id}\r\n"
                     f"CSeq: {cseq} REGISTER\r\n"
-                    f"Contact: <sip:{SIP_EXTENSION}@{SIP_SERVER}:{port}>\r\n"
+                    f"Contact: <sip:{SIP_EXTENSION}@{SIP_SERVER}:{SIP_PORT};transport=tcp>\r\n"
                     f"Expires: 300\r\n"
                     f"Max-Forwards: 70\r\n"
                     f"User-Agent: YeastarRelay/1.0\r\n"
@@ -319,9 +329,8 @@ def sip_registration_loop():
                 msg += "Content-Length: 0\r\n\r\n"
                 return msg
 
-            sock.sendto(make_register(1).encode(), addr)
-            resp1, _ = sock.recvfrom(4096)
-            resp1 = resp1.decode(errors="ignore")
+            sock.sendall(make_register(1).encode())
+            resp1 = sock.recv(4096).decode(errors="ignore")
 
             if "401" in resp1 or "407" in resp1:
                 realm_m = re.search(r'realm="([^"]+)"', resp1)
@@ -334,19 +343,19 @@ def sip_registration_loop():
                 auth    = (f'Digest username="{SIP_USER}",realm="{realm}",'
                            f'nonce="{nonce}",uri="sip:{SIP_SERVER}",'
                            f'response="{res}",algorithm=MD5')
-                sock.sendto(make_register(2, auth).encode(), addr)
-                resp2, _ = sock.recvfrom(4096)
-                resp2 = resp2.decode(errors="ignore")
+                sock.sendall(make_register(2, auth).encode())
+                resp2 = sock.recv(4096).decode(errors="ignore")
                 if "200 OK" in resp2:
-                    print(f"✅ SIP enregistré : {SIP_EXTENSION}@{SIP_SERVER}")
+                    print(f"✅ SIP enregistré (TCP) : {SIP_EXTENSION}@{SIP_SERVER}")
                 else:
                     print(f"⚠️ SIP échec : {resp2[:80]}")
             elif "200 OK" in resp1:
-                print(f"✅ SIP enregistré : {SIP_EXTENSION}@{SIP_SERVER}")
+                print(f"✅ SIP enregistré (TCP) : {SIP_EXTENSION}@{SIP_SERVER}")
             else:
                 print(f"⚠️ SIP inattendu : {resp1[:80]}")
 
             sock.close()
+
         except Exception as e:
             print(f"⚠️ SIP registration erreur : {e}")
 
@@ -355,13 +364,11 @@ def sip_registration_loop():
 # ── FastAPI ──────────────────────────────────────────────────────────────────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Lance le serveur SIP
-    t1 = threading.Thread(target=sip_server_thread, daemon=True)
+    t1 = threading.Thread(target=sip_tcp_server, daemon=True)
     t1.start()
-    # Lance l'enregistrement SIP
     t2 = threading.Thread(target=sip_registration_loop, daemon=True)
     t2.start()
-    print("🚀 Relay démarré — SIP server + registration lancés")
+    print("🚀 Relay démarré — SIP TCP server + registration lancés")
     yield
     print("🛑 Relay arrêté")
 
@@ -377,7 +384,8 @@ async def root():
         "status": "opérationnel",
         "sip_server": SIP_SERVER,
         "extension": SIP_EXTENSION,
-        "sip_port": SIP_PORT,
+        "transport": "TCP",
+        "sip_proxy": SIP_PROXY,
     }
 
 if __name__ == "__main__":
